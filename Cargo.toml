@@ -1,0 +1,7 @@
+[package]
+name = "sm213_interpreter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sm213_parser = { git = "https://github.com/Gabeperson/sm213_parser", version = "0.1.0" }
