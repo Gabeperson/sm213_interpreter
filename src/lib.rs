@@ -1,16 +1,29 @@
+use parser::span::Span;
 use sm213_parser::*;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     hash::{BuildHasher, Hasher},
     ops::BitOr,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Memory {
     // This takes up 5x the amount but makes it easy to detect overwrites, so we use it
     // Also because the actual simulator only supports memory up to ~1mb, this should
     // have an absolute max of 5mb
     buffer: HashMap<i32, u8, IdentityHasherGenerator>,
+}
+
+impl std::fmt::Debug for Memory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let treemap = self.buffer.iter().collect::<BTreeMap<_, _>>();
+        writeln!(f, "\nMemory: {{")?;
+        for (k, v) in treemap {
+            writeln!(f, "    {k:x}: {v:0>2x}")?;
+        }
+        writeln!(f, "}}\n")?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Copy)]
@@ -117,14 +130,29 @@ impl Memory {
         Ok(write_type)
     }
 
+    pub fn write_i32_unaligned(
+        &mut self,
+        address: i32,
+        data: i32,
+    ) -> Result<WriteType, MemoryAccessError> {
+        self.err_on_address(address, 4, 1)?;
+        let [b1, b2, b3, b4] = data.to_be_bytes();
+        let mut write_type = WriteType::Regular;
+        write_type |= self.write_byte(address, b1);
+        write_type |= self.write_byte(address + 1, b2);
+        write_type |= self.write_byte(address + 2, b3);
+        write_type |= self.write_byte(address + 3, b4);
+        Ok(write_type)
+    }
+
     pub fn read_instruction(&self, address: i32) -> Result<(u16, i32), MemoryAccessError> {
-        // technically should be size 2 for maximum compatibility, but
-        // We assume no one is going to place a jump or ld immediate at
-        // positions > 0xffffa
-        self.err_on_address(address, 6, 2)?;
+        self.err_on_address(address, 2, 2)?;
         let b1 = self.read_byte(address);
         let b2 = self.read_byte(address + 1);
-        let imm = self.read_i32(address + 2)?;
+        // This will technically cause issues if the user manually sets bytes at
+        // between 0xffffc to 0xffffff to a ld immediate or jump immediate
+        // then jumps there, but we turn a blind eye to this.
+        let imm = self.read_i32(address + 2).unwrap_or(0);
         let ins = u16::from_be_bytes([b1, b2]);
         Ok((ins, imm))
     }
@@ -153,7 +181,7 @@ impl Memory {
         let mut write_type = WriteType::Regular;
         write_type |= self.write_byte(address, b1);
         write_type |= self.write_byte(address + 1, b2);
-        write_type |= self.write_i32(address + 2, imm)?;
+        write_type |= self.write_i32_unaligned(address + 2, imm)?;
         Ok(write_type)
     }
 
@@ -199,6 +227,12 @@ pub enum CompileError {
         instruction_index: usize,
         err: MemoryAccessError,
     },
+    BranchTooFar {
+        inst_index: usize,
+        branch_from: i32,
+        branch_to: i32,
+        branch_to_label: Option<(String, Span)>,
+    },
 }
 
 pub fn compile(program: &Program) -> Result<Memory, CompileError> {
@@ -212,6 +246,7 @@ struct Compiler<'a> {
     labels: HashMap<&'a str, i32>,
     memory: Memory,
     label_queue: Vec<(&'a str, i32)>,
+    branch_label_queue: Vec<(Label<'a>, i32, usize)>,
     loc_map: HashMap<i32, usize>,
     iter_index: usize,
 }
@@ -223,6 +258,7 @@ impl<'a> Compiler<'a> {
             labels: HashMap::new(),
             memory: Memory::new(),
             label_queue: Vec::new(),
+            branch_label_queue: Vec::new(),
             loc_map: HashMap::new(),
             iter_index: 0,
         }
@@ -254,9 +290,57 @@ impl<'a> Compiler<'a> {
                     }
                     _ => self.push_instruction2(inst.to_quad_hexit())?,
                 },
-                Instruction::Branch { to } => todo!(),
-                Instruction::BranchIfEqual { reg, to } => todo!(),
-                Instruction::BranchIfGreater { reg, to } => todo!(),
+                Instruction::Branch { to: (to, _) } => match to {
+                    BranchLocation::Address(a) => {
+                        let branch_offset =
+                            self.check_branch(self.loc, a.value, self.iter_index, None)?;
+                        self.push_instruction2(inst_from_parts(
+                            8,
+                            0xF,
+                            (branch_offset >> 4) & 0xF,
+                            branch_offset & 0xF,
+                        ))?;
+                    }
+                    BranchLocation::Label(l) => {
+                        self.branch_label_queue
+                            .push((l, self.loc + 1, self.iter_index));
+                        self.push_instruction2(0x8FFF)?;
+                    }
+                },
+                Instruction::BranchIfEqual { reg, to: (to, _) } => match to {
+                    BranchLocation::Address(a) => {
+                        let branch_offset =
+                            self.check_branch(self.loc, a.value, self.iter_index, None)?;
+                        self.push_instruction2(inst_from_parts(
+                            9,
+                            reg.value(),
+                            (branch_offset >> 4) & 0xF,
+                            branch_offset & 0xF,
+                        ))?;
+                    }
+                    BranchLocation::Label(l) => {
+                        self.branch_label_queue
+                            .push((l, self.loc + 1, self.iter_index));
+                        self.push_instruction2(inst_from_parts(9, reg.value(), 0xF, 0xF))?;
+                    }
+                },
+                Instruction::BranchIfGreater { reg, to: (to, _) } => match to {
+                    BranchLocation::Address(a) => {
+                        let branch_offset =
+                            self.check_branch(self.loc, a.value, self.iter_index, None)?;
+                        self.push_instruction2(inst_from_parts(
+                            0xA,
+                            reg.value(),
+                            (branch_offset >> 4) & 0xF,
+                            branch_offset & 0xF,
+                        ))?;
+                    }
+                    BranchLocation::Label(l) => {
+                        self.branch_label_queue
+                            .push((l, self.loc + 1, self.iter_index));
+                        self.push_instruction2(inst_from_parts(0xA, reg.value(), 0xF, 0xF))?;
+                    }
+                },
                 ref inst @ Instruction::Jump { to: (jump_loc, _) } => match jump_loc {
                     JumpLocation::Label(l) => {
                         self.label_queue.push((l.0, self.loc + 2));
@@ -280,11 +364,40 @@ impl<'a> Compiler<'a> {
                 ref inst => self.push_instruction2(inst.to_quad_hexit())?,
             }
         }
-        todo!()
+        for (label, loc) in self.label_queue.iter() {
+            let label_loc = *self.labels.get(label).unwrap();
+            self.memory.write_i32_unaligned(*loc, label_loc).unwrap();
+        }
+        for (label, loc, index) in self.branch_label_queue.iter() {
+            let label_loc = *self.labels.get(label.0).unwrap();
+            let offset = self.check_branch(*loc, label_loc, *index, Some(*label))?;
+            self.memory.write_byte(*loc, offset);
+        }
+
+        Ok(self.memory)
     }
 }
 
 impl<'a> Compiler<'a> {
+    fn check_branch(
+        &self,
+        from: i32,
+        to: i32,
+        instruction_index: usize,
+        label: Option<Label<'_>>,
+    ) -> Result<u8, CompileError> {
+        let distance = to - from;
+        if !(-254..=256).contains(&distance) {
+            return Err(CompileError::BranchTooFar {
+                inst_index: instruction_index,
+                branch_from: from,
+                branch_to: to,
+                branch_to_label: label.map(|s| (s.0.to_owned(), s.1)),
+            });
+        }
+        let branch_offset = ((distance + 254) / 2) as u8;
+        Ok(branch_offset)
+    }
     fn check_not_overlap(
         &self,
         kind: WriteType,
